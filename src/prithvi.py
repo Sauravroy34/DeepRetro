@@ -5,7 +5,7 @@ import rootutils
 import structlog
 
 from src.utils.parse import format_output
-from src.rec_prithvi import rec_run_prithvi
+from src.rec_prithvi import rec_run_prithvi , single_run_DeepRetro
 from src.utils.job_context import logger as context_logger
 from src.utils.custom_logging import add_job_specific_handler
 from src.metadata import reagent_agent, conditions_agent, literature_agent
@@ -15,6 +15,48 @@ root_dir = rootutils.setup_root(__file__,
                                 pythonpath=True)
 
 date_dir = f'{root_dir}/logs/{time.strftime("%Y-%m-%d")}'
+
+
+
+def run_single_retro(molecule: str,
+                     llm: str = "claude-opus-4-20250514",
+                     az_model: str = "USPTO",
+                     stability_flag: str = "False",
+                     hallucination_check: str = "False",
+                     use_protecting_group_feature: bool = False) -> dict:
+
+        # Generate a unique job ID using timestamp and a random suffix
+    job_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+
+    job_log_file = f"{date_dir}/job_{job_id}.log"
+    log = structlog.get_logger().bind(job_id=job_id)
+    # Set the logger in the context variable
+    token = context_logger.set(log)
+
+    # Add job-specific handler
+    handler = add_job_specific_handler(log, job_id)
+    log.info(f"Starting new synthesis job {job_id} for molecule {molecule}")
+
+    try:
+        result_dict, _ = single_run_DeepRetro(
+            molecule=molecule,
+            job_id=job_id,
+            llm=llm,
+            az_model=az_model,
+            stability_flag=stability_flag,
+            hallucination_check=hallucination_check,
+            use_protecting_group_feature=use_protecting_group_feature)
+        output_data = format_output(result_dict)
+        output_data = add_metadata(output_data)
+        return output_data
+    finally:
+        # Clean up handlers
+        log._logger.removeHandler(handler)
+        handler.close()
+        context_logger.reset(token)
+
+
+
 
 
 def run_prithvi(molecule: str,

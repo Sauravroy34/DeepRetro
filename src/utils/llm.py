@@ -125,7 +125,8 @@ def call_LLM(molecule: str,
              LLM: str = "claude-opus-4-8",
              temperature: float = 0.0,
              messages: Optional[list[dict]] = None,
-             use_protecting_group_feature: bool = False) -> tuple[int, str]:
+             use_protecting_group_feature: bool = False,
+             local: bool = False) -> tuple[int, str]:
     """Calls the LLM model to predict the next step
 
     Parameters
@@ -215,6 +216,28 @@ def call_LLM(molecule: str,
         }]
     params["messages"] = messages
 
+
+    if local:
+        params["user_prompt"] = user_prompt_final
+        params["sys_prompt"] = sys_prompt_final
+
+
+
+    if local:
+        from deepretro.utils.hf import generate
+
+        response = generate(
+            model_name=params["model"],
+            smiles=molecule,
+            user_prompt=user_prompt_final,
+            top_p=params["top_p"],
+            max_tokens=params["max_completion_tokens"],
+            SYS_PROMPT=sys_prompt_final,
+            temperature=params["temperature"],
+        )
+
+        return 200, response
+
     try:
         # Call the LLM model
         response = completion(**params)
@@ -233,6 +256,14 @@ def call_LLM(molecule: str,
     log_message(f"Received response from LLM: {res_text}", logger)
     return 200, res_text
 
+
+def extract_json_fenced(res_text: str) -> str:
+    import re
+    # Handles ```json\n{...}\n``` and also a bare ```\n{...}\n```
+    match = re.search(r"```(?:json)?\s*\n(.*?)```", res_text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return ""
 
 def split_cot_json(res_text: str) -> tuple[int, list[str], str]:
     """Parse the LLM response to extract the thinking steps and json content
@@ -360,7 +391,7 @@ def split_json_master(res_text: str, model: str) -> tuple[int, list[str], str]:
             status_code, json_content = split_json_openAI(res_text)
             thinking_steps = []
         else:
-            status_code, thinking_steps, json_content = split_cot_json(
+            status_code, thinking_steps, json_content = extract_json_fenced(
                 res_text)
     except Exception as e:
         return 505, [], ""
@@ -400,7 +431,8 @@ def llm_pipeline(
     messages: Optional[list[dict]] = None,
     stability_flag: str = "False",
     hallucination_check: str = "False",
-    use_protecting_group_feature: bool = False
+    use_protecting_group_feature: bool = False,
+    local : bool = False
 ) -> tuple[list[list[str]], list[str], list[float]]:
     """Pipeline to call LLM and validate the results
 
@@ -444,10 +476,11 @@ def llm_pipeline(
             current_model,
             messages=messages,
             temperature=run,
-            use_protecting_group_feature=use_protecting_group_feature)
+            use_protecting_group_feature=use_protecting_group_feature,
+            local=local)
         if status_code != 200:
             log_message(f"Error in calling LLM: {res_text}", logger)
-            run += 0.1
+            run += 1
             get_error_log(status_code)
             continue
 
@@ -457,7 +490,7 @@ def llm_pipeline(
             res_text, current_model)
         if status_code != 200:
             log_message(f"Error in splitting cot json: {res_text}", logger)
-            run += 0.1
+            run += 1
             get_error_log(status_code)
             continue
 
@@ -468,7 +501,7 @@ def llm_pipeline(
         if status_code != 200:
             log_message(f"Error in validating split json content: {res_text}",
                         logger)
-            run += 0.1
+            run += 1
             get_error_log(status_code)
             continue
 
