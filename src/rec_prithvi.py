@@ -15,6 +15,7 @@ def rec_run_prithvi(
         hallucination_check: str = "False",
         use_protecting_group_feature: bool = False,
         visited=None,
+        local= False,
         depth=0,
         max_depth=50) -> tuple[dict, bool]:
     """Recursive function to run Prithvi on a molecule
@@ -84,7 +85,8 @@ def rec_run_prithvi(
             LLM=llm,
             stability_flag=stability_flag,
             hallucination_check=hallucination_check,
-            use_protecting_group_feature=use_protecting_group_feature)
+            use_protecting_group_feature=use_protecting_group_feature,
+            local  = local)
         result_dict = {
             'type':
             'mol',
