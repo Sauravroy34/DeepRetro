@@ -1,0 +1,538 @@
+"""Batch retrosynthesis runner.
+
+End-to-end driver: download a CSV from a public Google Sheet, (optionally) train
+the hallucination checker, read target molecules from a text file, run each
+through :class:`deepretro.algorithms.autosolve.AutoSolver`, and dump the routes
+as ``<out>/<timestamp>/<molecule>/pathway_<i>.json``. Each molecule directory
+also receives ``llm_calls.jsonl``, one JSON line per LLM call made for that
+target (see :mod:`deepretro.utils.llm_trace`).
+
+The training step is a **template** (see :func:`train_hallucination_checker`): it
+runs only when the CSV carries the expected labelled columns, and otherwise logs
+and falls back to the heuristic hallucination mode so the batch still runs.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import time
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import structlog
+from rdkit import Chem
+from sklearn.model_selection import train_test_split
+
+from deepretro.models.hallucination_trainer import HallucinationTrainer
+from deepretro.score import empty_pathway_scores, score_pathway
+from deepretro.utils.llm_trace import molecule_trace
+from deepretro.utils.utils_molecule import canonicalize, try_canonicalize
+
+logger = structlog.get_logger(__name__)
+
+# Solver hook: molecule SMILES -> list of parsed pathway dicts.
+SolveMolecule = Callable[[str], list[dict[str, Any]]]
+# HTTP hook: (url, timeout) -> response with ``content`` and ``raise_for_status``.
+HttpGet = Callable[..., Any]
+
+REQUIRED_TRAINING_COLUMNS = {"product", "reactants", "label"}
+
+
+def read_molecules(path: str) -> list[str]:
+    """Read target SMILES from a text file (one per line), canonicalized.
+
+    Blank lines and lines starting with ``#`` are skipped; surrounding
+    whitespace is stripped. Every parseable line is rewritten to its RDKit
+    canonical form (stereochemistry preserved). Unparseable lines are kept
+    verbatim and logged so the downstream ``error.json`` path still triggers.
+
+    Parameters
+    ----------
+    path : str
+        Path to the molecules file.
+
+    Returns
+    -------
+    list[str]
+        Target SMILES strings, canonical where RDKit could parse them.
+
+    Examples
+    --------
+    >>> import tempfile, os
+    >>> path = os.path.join(tempfile.mkdtemp(), "m.txt")
+    >>> _ = open(path, "w").write("C(C)O\\n# note\\n\\nCCN\\n")
+    >>> read_molecules(path)
+    ['CCO', 'CCN']
+    """
+    molecules: list[str] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        canonical = try_canonicalize(stripped)
+        if canonical is None:
+            logger.warning(
+                "Target SMILES does not parse; keeping verbatim",
+                molecule=stripped,
+            )
+            molecules.append(stripped)
+        else:
+            molecules.append(canonical)
+    return molecules
+
+
+def slugify_molecule(smiles: str) -> str:
+    """Build a filesystem-safe, unique directory name for a molecule.
+
+    Combines a readable ASCII-safe prefix with a short hash of the original
+    SMILES so distinct molecules never collide and the same SMILES is stable.
+
+    Parameters
+    ----------
+    smiles : str
+        Molecule SMILES.
+
+    Returns
+    -------
+    str
+        A safe directory name.
+
+    Examples
+    --------
+    >>> slugify_molecule("CCO") == slugify_molecule("CCO")
+    True
+    >>> "/" in slugify_molecule("CC(=O)O")
+    False
+    """
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", smiles)[:60]
+    digest = hashlib.md5(smiles.encode("utf-8")).hexdigest()[:8]
+    return f"{safe}_{digest}"
+
+
+def download_sheet_csv(
+    url: str,
+    dest: str,
+    *,
+    http_get: HttpGet | None = None,
+) -> str:
+    """Download a published Google Sheet CSV export to *dest*.
+
+    Parameters
+    ----------
+    url : str
+        The sheet's ``/export?format=csv`` URL (published / link-shared; no
+        auth is used).
+    dest : str
+        Local path to write the CSV to.
+    http_get : callable, optional
+        Injectable HTTP getter (defaults to ``requests.get``). Must return a
+        response exposing ``content`` and ``raise_for_status``.
+
+    Returns
+    -------
+    str
+        The destination path.
+
+    Raises
+    ------
+    Exception
+        Whatever ``raise_for_status`` raises on a non-2xx response.
+    """
+    if http_get is None:
+        import requests
+
+        http_get = requests.get
+    response = http_get(url, timeout=60)
+    response.raise_for_status()
+    Path(dest).write_bytes(response.content)
+    logger.info("Downloaded sheet CSV", url=url, dest=dest)
+    return dest
+
+
+def train_hallucination_checker(csv_path: str, save_dir: str) -> str | None:
+    """Train the ML hallucination checker from a labelled CSV (TEMPLATE).
+
+    Runs only when the CSV has ``product``/``reactants``/``label`` columns;
+    otherwise logs and returns ``None`` so the batch falls back to the
+    heuristic checker. The training body is a template for a downstream
+    contributor to complete/tune for their dataset; any failure degrades to
+    ``None`` rather than aborting the batch.
+
+    Note: Ensure reactants are of the from SMILES-A.SMILES-B....
+
+    Parameters
+    ----------
+    csv_path : str
+        Path to the training CSV.
+    save_dir : str
+        Directory to save the trained model into.
+
+    Returns
+    -------
+    str or None
+        ``save_dir`` when a model was trained and saved, else ``None``.
+    """
+    MODEL_TYPE = "xgboost"
+    try:
+        # 1. Load CSV and validate columns
+        df = pd.read_csv(csv_path)
+
+        required_cols = {"product", "reactants", "label"}
+        if not required_cols.issubset(df.columns):
+            logger.warning(
+                f"Training aborted: CSV missing required columns {required_cols}. "
+                f"Found {list(df.columns)}. Falling back to heuristic checker."
+            )
+            return None
+
+        # 2. Setup workspace and data partitions
+        os.makedirs(save_dir, exist_ok=True)
+        train_csv = os.path.join(save_dir, "train.csv")
+        test_csv = os.path.join(save_dir, "test.csv")
+
+        # Stratified split based on the label
+        train_df, test_df = train_test_split(
+            df, test_size=0.2, random_state=42, stratify=df["label"]
+        )
+
+        train_df.to_csv(train_csv, index=False)
+        test_df.to_csv(test_csv, index=False)
+        logger.info(f"Saved split datasets to {save_dir}")
+
+        # 3. Initialize Trainer and Load Datasets
+        trainer = HallucinationTrainer(
+            trainer_dir=save_dir, model_type=MODEL_TYPE, n_tasks=1
+        )
+
+        train_dataset, test_dataset = trainer.load_dataset(
+            train_csv=train_csv,
+            test_csv=test_csv,
+            product_col="product",
+            reactants_col="reactants",
+            label_col="label",
+        )
+
+        # 4. Execute Training and Optimization
+        logger.info("Starting automated optimization loop...")
+        final_model, test_performance = trainer.train_model(
+            train_dataset=train_dataset,
+            test_dataset=test_dataset,
+            tune_params=True,
+            n_trials=10,  # Keep low for execution speed
+            k_folds=5,
+        )
+
+        logger.info(f"Training Complete. Test Partition Scores: {test_performance}")
+        return os.path.join(save_dir, f"{MODEL_TYPE}_model")
+
+    except Exception as e:
+        # Any failure degrades to None rather than crashing the batch
+        logger.error(f"Failed to train hallucination checker: {str(e)}")
+        return None
+
+
+def solve_molecule(
+    solver: Any, smiles: str, top_k: int, *, include_metadata: bool = True
+) -> list[dict[str, Any]]:
+    """Solve one molecule into up to ``top_k`` parsed pathway dicts.
+
+    Parameters
+    ----------
+    solver : AutoSolver
+        Any object exposing ``solve_multiple``, ``parse``, and ``add_metadata``.
+    smiles : str
+        Target molecule SMILES.
+    top_k : int
+        Maximum number of candidate routes.
+    include_metadata : bool, optional
+        When ``True`` (default) each pathway is enriched via
+        ``solver.add_metadata`` (reagent/condition/literature LLM calls). Set
+        to ``False`` to skip that stage entirely (saves cost/time).
+
+    Returns
+    -------
+    list[dict]
+        Parsed pathway dicts, each tagged with its ``target`` SMILES.
+    """
+    pathways: list[dict[str, Any]] = []
+    for route, solved in solver.solve_multiple(smiles, k=top_k):
+        parsed = solver.parse(route, solved=solved)
+        if include_metadata:
+            parsed = solver.add_metadata(parsed)
+        parsed["target"] = smiles
+        pathways.append(parsed)
+    return pathways
+
+
+def run_batch(
+    molecules: list[str],
+    out_dir: str,
+    *,
+    timestamp: str,
+    solve: SolveMolecule,
+) -> dict[str, list[str]]:
+    """Run each molecule and write its routes under ``out_dir/timestamp/molecule``.
+
+    A per-molecule failure writes ``error.json`` and never aborts the batch.
+    Each molecule is solved inside a :func:`deepretro.utils.llm_trace.molecule_trace`
+    so its LLM calls are grouped into one Langfuse session and mirrored to
+    ``llm_calls.jsonl`` next to that molecule's pathway files.
+
+    Parameters
+    ----------
+    molecules : list[str]
+        Target SMILES.
+    out_dir : str
+        Root output directory.
+    timestamp : str
+        Run timestamp used as the second path level.
+    solve : callable
+        ``smiles -> list[dict]`` producing the parsed pathways for a molecule.
+
+    Returns
+    -------
+    dict[str, list[str]]
+        Map from each molecule to the file paths written for it.
+    """
+    run_dir = Path(out_dir) / timestamp
+    written: dict[str, list[str]] = {}
+
+    for raw_smiles in molecules:
+        smiles = canonicalize(raw_smiles)
+        mol_dir = run_dir / slugify_molecule(smiles)
+        mol_dir.mkdir(parents=True, exist_ok=True)
+
+        # Invalid targets receive an error artifact without invoking the solver.
+        if Chem.MolFromSmiles(smiles) is None:
+            error_file = mol_dir / "error.json"
+            error_file.write_text(
+                json.dumps(
+                    {"smiles": smiles, "error": "target SMILES does not parse"},
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            written[smiles] = [str(error_file)]
+            logger.error("Target SMILES does not parse; skipping", molecule=smiles)
+            continue
+
+        try:
+            # The trace must be active for the whole call, failures included, so
+            # ``llm_calls.jsonl`` lands beside pathway_<i>.json / error.json.
+            with molecule_trace(smiles, log_dir=mol_dir):
+                pathways = solve(smiles)
+            paths: list[str] = []
+            for index, pathway in enumerate(pathways, start=1):
+                pathway = _with_pathway_scores(pathway)
+                target = mol_dir / f"pathway_{index}.json"
+                target.write_text(json.dumps(pathway, indent=2), encoding="utf-8")
+                paths.append(str(target))
+            written[smiles] = paths
+            logger.info("Wrote pathways", molecule=smiles, count=len(paths))
+        except Exception as exc:  # ponytail: one bad molecule must not kill the run
+            error_file = mol_dir / "error.json"
+            error_file.write_text(
+                json.dumps({"smiles": smiles, "error": str(exc)}, indent=2),
+                encoding="utf-8",
+            )
+            written[smiles] = [str(error_file)]
+            logger.error("Molecule failed", molecule=smiles, error=str(exc))
+
+    return written
+
+
+def _with_pathway_scores(pathway: dict[str, Any]) -> dict[str, Any]:
+    """Attach pathway scoring output without aborting the batch on score errors."""
+    scored_pathway = dict(pathway)
+    try:
+        scored_pathway["scores"] = score_pathway(scored_pathway)
+    except Exception as exc:
+        logger.warning("Pathway scoring failed", error=str(exc))
+        scored_pathway["scores"] = empty_pathway_scores(
+            f"Pathway scoring failed: {exc}"
+        )
+    return scored_pathway
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Build the batch runner argument parser."""
+    parser = argparse.ArgumentParser(
+        description="DeepRetro batch retrosynthesis runner"
+    )
+    parser.add_argument(
+        "--sheet-url",
+        help="Public Google Sheets CSV export URL; required when training a classifier.",
+    )
+    parser.add_argument(
+        "--molecules",
+        required=True,
+        help="Path to a text file of target SMILES (one per line). "
+        "TODO: supply the molecules file.",
+    )
+    parser.add_argument("--out", default="batch_output", help="Output directory root")
+    parser.add_argument(
+        "--csv", default="hallucination_data.csv", help="CSV download path"
+    )
+    parser.add_argument(
+        "--solve-mode",
+        choices=["pipeline", "single_step_agent"],
+        default="pipeline",
+        help="Retrosynthesis mode (orchestrator is not offered)",
+    )
+    parser.add_argument(
+        "--tool-backend", choices=["structured", "sandbox"], default="structured"
+    )
+    parser.add_argument(
+        "--hallucination-weights",
+        default=None,
+        help=(
+            "Path to heuristic penalty weights as HallucinationWeights JSON. "
+            "Omit to use the default weights; ignored outside heuristic mode."
+        ),
+    )
+    parser.add_argument("--model", default="anthropic/claude-sonnet-4-6")
+    parser.add_argument("--az-model", default="Pistachio_100+")
+    parser.add_argument(
+        "--classifier",
+        default=None,
+        help="Path to a trained hallucination model dir (enables ML mode)",
+    )
+    parser.add_argument("--top-k", type=int, default=3)
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        default=6,
+        help="Maximum retrosynthesis recursion depth (cost control)",
+    )
+    parser.add_argument(
+        "--agent-min-iterations",
+        type=int,
+        default=5,
+        help="Lower cap on the per-node agent turn budget (single_step_agent)",
+    )
+    parser.add_argument(
+        "--agent-max-iterations",
+        type=int,
+        default=15,
+        help="Upper cap on the per-node agent turn budget (single_step_agent)",
+    )
+    parser.add_argument(
+        "--agent-iteration-decay",
+        type=float,
+        default=0.75,
+        help="Per-depth multiplier on the agent turn budget: "
+        "clamp(carbons * decay**depth, min, max)",
+    )
+    parser.add_argument(
+        "--skip-metadata",
+        action="store_true",
+        help="Skip the add_metadata enrichment stage (saves cost/time)",
+    )
+    parser.add_argument(
+        "--hallucination-mode",
+        choices=["auto", "heuristic", "ml", "none"],
+        default="auto",
+        help="'none' disables hallucination checking; 'heuristic' forces the "
+        "heuristic checker (no training); 'ml' "
+        "trains (or uses --classifier); 'auto' trains only if labelled data is "
+        "present, else heuristic.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Run the batch pipeline from the command line.
+
+    Parameters
+    ----------
+    argv : list[str], optional
+        Argument vector (defaults to ``sys.argv``).
+    """
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+
+    # Resolve the hallucination checker. 'heuristic' skips training (and the
+    # sheet download); 'ml'/'auto' train from the labelled sheet unless a
+    # pre-trained --classifier is supplied.
+    classifier_dir: str | None = None
+    if args.hallucination_mode not in ("heuristic", "none"):
+        if args.classifier:
+            classifier_dir = args.classifier
+        else:
+            if not args.sheet_url:
+                parser.error("--sheet-url is required when training a classifier")
+            download_sheet_csv(args.sheet_url, args.csv)
+            classifier_dir = train_hallucination_checker(
+                args.csv, str(Path(args.out) / "hallucination_model")
+            )
+        if args.hallucination_mode == "ml" and not classifier_dir:
+            raise SystemExit(
+                "hallucination-mode=ml requested but no classifier was trained "
+                "(check the sheet's product/reactants/label columns)."
+            )
+
+    if args.hallucination_mode == "none":
+        hallucination_mode = "none"
+    else:
+        hallucination_mode = "ml" if classifier_dir else "heuristic"
+
+    hallucination_weights = None
+    if hallucination_mode == "heuristic" and args.hallucination_weights:
+        from deepretro.algorithms.hallucination_weights import HallucinationWeights
+
+        hallucination_weights = HallucinationWeights.from_json(
+            args.hallucination_weights
+        )
+        logger.info("Loaded heuristic weights", path=args.hallucination_weights)
+
+    molecules = read_molecules(args.molecules)
+    logger.info(
+        "Starting batch",
+        molecules=len(molecules),
+        timestamp=timestamp,
+        solve_mode=args.solve_mode,
+        hallucination_mode=hallucination_mode,
+        max_depth=args.max_depth,
+        agent_iterations=(
+            args.agent_min_iterations,
+            args.agent_max_iterations,
+            args.agent_iteration_decay,
+        ),
+        metadata=not args.skip_metadata,
+    )
+
+    from deepretro.algorithms.autosolve import AutoSolver
+
+    solver = AutoSolver(
+        llm=args.model,
+        az_model=args.az_model,
+        solve_mode=args.solve_mode,
+        tool_backend=args.tool_backend,
+        hallucination_mode=hallucination_mode,
+        hallucination_classifier=classifier_dir,
+        hallucination_weights=hallucination_weights,
+        max_depth=args.max_depth,
+        agent_min_iterations=args.agent_min_iterations,
+        agent_max_iterations=args.agent_max_iterations,
+        agent_iteration_decay=args.agent_iteration_decay,
+    )
+
+    run_batch(
+        molecules,
+        args.out,
+        timestamp=timestamp,
+        solve=lambda smiles: solve_molecule(
+            solver, smiles, args.top_k, include_metadata=not args.skip_metadata
+        ),
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

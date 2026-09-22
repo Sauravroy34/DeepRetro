@@ -11,6 +11,9 @@ from src.variables import USER_PROMPT_OPENAI, SYS_PROMPT_OPENAI
 from src.variables import USER_PROMPT_DEEPSEEK, SYS_PROMPT_DEEPSEEK
 from src.variables import ADDON_PROMPT_7_MEMBER, USER_PROMPT_DEEPSEEK_V4
 from src.variables import ERROR_MAP, PROTECTING_GROUP_CONTEXT
+from src.variables import CLAUDE_EXTENDED_THINKING_MODELS
+from src.variables import EXTENDED_THINKING_BUDGET_TOKENS
+from src.variables import EXTENDED_THINKING_MAX_TOKENS
 from src.cache import cache_results
 from src.utils.utils_molecule import validity_check, detect_seven_member_rings
 from src.utils.job_context import logger as context_logger
@@ -48,6 +51,26 @@ def log_message(message: str, logger=None):
         logger.info(message)
     else:
         print(message)
+
+
+def supports_extended_thinking(LLM: str) -> bool:
+    """Check whether the model supports Anthropic extended thinking.
+
+    Parameters
+    ----------
+    LLM : str
+        The LLM model identifier, possibly with a provider prefix
+        (e.g. "anthropic/claude-sonnet-4-20250514") and/or an ":adv"
+        advanced-prompt suffix.
+
+    Returns
+    -------
+    bool
+        True if extended thinking should be enabled for this model
+    """
+    model_name = LLM.split("/")[-1].split(":")[0]
+    return any(known in model_name
+               for known in CLAUDE_EXTENDED_THINKING_MODELS)
 
 
 def obtain_prompt(LLM: str):
@@ -99,10 +122,11 @@ def obtain_prompt(LLM: str):
 
 @cache_results
 def call_LLM(molecule: str,
-             LLM: str = "claude-opus-4-20250514",
+             LLM: str = "claude-opus-4-8",
              temperature: float = 0.0,
              messages: Optional[list[dict]] = None,
-             use_protecting_group_feature: bool = False) -> tuple[int, str]:
+             use_protecting_group_feature: bool = False,
+             local: bool = False) -> tuple[int, str]:
     """Calls the LLM model to predict the next step
 
     Parameters
@@ -110,7 +134,7 @@ def call_LLM(molecule: str,
     molecule : str
         The target molecule for retrosynthesis
     LLM : str, optional
-        The LLM model to be used, by default "claude-opus-4-20250514"
+        The LLM model to be used, by default "claude-opus-4-8"
     temperature : float, optional
         The temperature for sampling, by default 0.0
     messages : Optional[list[dict]], optional
@@ -154,18 +178,31 @@ def call_LLM(molecule: str,
         "seed": 42,
         "top_p": 0.9,
         "metadata": get_langfuse_metadata("retrosynthesis"),
+        "drop_params": True,
     }
 
     if LLM in DEEPSEEK_MODELS:
         user_prompt_final += add_on
 
-    if "3-7" in LLM:
-        params["max_tokens"] = 13192 + 5000
+    if supports_extended_thinking(LLM):
+        params["max_tokens"] = EXTENDED_THINKING_MAX_TOKENS
         params["temperature"] = 1
         params.pop("top_p", None)
         params.pop("max_completion_tokens", None)
-        params['thinking'] = {"type": "enabled", "budget_tokens": 5000}
+        try:
+            is_adaptive_thinking_model = "claude-opus-4-8" in LLM or bool(
+                litellm.get_model_info(LLM).get("supports_adaptive_thinking"))
+        except Exception:
+            is_adaptive_thinking_model = False
+        if is_adaptive_thinking_model:
+            params['thinking'] = {"type": "adaptive"}
+        else:
+            params['thinking'] = {
+                "type": "enabled",
+                "budget_tokens": EXTENDED_THINKING_BUDGET_TOKENS
+            }
 
+    params = {k: v for k, v in params.items() if LLM != "claude-opus-4-8" or k not in ("temperature", "top_p", "seed")}
     if messages is None:
         messages = [{
             "role": "system",
@@ -178,6 +215,28 @@ def call_LLM(molecule: str,
             add_on
         }]
     params["messages"] = messages
+
+
+    if local:
+        params["user_prompt"] = user_prompt_final
+        params["sys_prompt"] = sys_prompt_final
+
+
+
+    if local:
+        from deepretro.utils.hf import generate
+
+        response = generate(
+            model_name=params["model"],
+            smiles=molecule,
+            user_prompt=user_prompt_final,
+            top_p=params["top_p"],
+            max_tokens=params["max_completion_tokens"],
+            SYS_PROMPT=sys_prompt_final,
+            temperature=params["temperature"],
+        )
+
+        return 200, response
 
     try:
         # Call the LLM model
@@ -197,6 +256,14 @@ def call_LLM(molecule: str,
     log_message(f"Received response from LLM: {res_text}", logger)
     return 200, res_text
 
+
+def extract_json_fenced(res_text: str) -> str:
+    import re
+    # Handles ```json\n{...}\n``` and also a bare ```\n{...}\n```
+    match = re.search(r"```(?:json)?\s*\n(.*?)```", res_text, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return ""
 
 def split_cot_json(res_text: str) -> tuple[int, list[str], str]:
     """Parse the LLM response to extract the thinking steps and json content
@@ -324,7 +391,7 @@ def split_json_master(res_text: str, model: str) -> tuple[int, list[str], str]:
             status_code, json_content = split_json_openAI(res_text)
             thinking_steps = []
         else:
-            status_code, thinking_steps, json_content = split_cot_json(
+            status_code, thinking_steps, json_content = extract_json_fenced(
                 res_text)
     except Exception as e:
         return 505, [], ""
@@ -364,7 +431,8 @@ def llm_pipeline(
     messages: Optional[list[dict]] = None,
     stability_flag: str = "False",
     hallucination_check: str = "False",
-    use_protecting_group_feature: bool = False
+    use_protecting_group_feature: bool = False,
+    local : bool = False
 ) -> tuple[list[list[str]], list[str], list[float]]:
     """Pipeline to call LLM and validate the results
 
@@ -408,10 +476,11 @@ def llm_pipeline(
             current_model,
             messages=messages,
             temperature=run,
-            use_protecting_group_feature=use_protecting_group_feature)
+            use_protecting_group_feature=use_protecting_group_feature,
+            local=local)
         if status_code != 200:
             log_message(f"Error in calling LLM: {res_text}", logger)
-            run += 0.1
+            run += 1
             get_error_log(status_code)
             continue
 
@@ -421,7 +490,7 @@ def llm_pipeline(
             res_text, current_model)
         if status_code != 200:
             log_message(f"Error in splitting cot json: {res_text}", logger)
-            run += 0.1
+            run += 1
             get_error_log(status_code)
             continue
 
@@ -432,7 +501,7 @@ def llm_pipeline(
         if status_code != 200:
             log_message(f"Error in validating split json content: {res_text}",
                         logger)
-            run += 0.1
+            run += 1
             get_error_log(status_code)
             continue
 

@@ -26,7 +26,8 @@ def main(smiles: str,
          az_model: str = "USPTO",
          stability_flag: str = "False",
          hallucination_check: str = "False",
-         use_protecting_group_feature: bool = False) -> Any:
+         use_protecting_group_feature: bool = False,
+         local: bool = False) -> Any:
     """Run the retrosynthesis on specific molecule.
 
     Parameters
@@ -48,6 +49,33 @@ def main(smiles: str,
     log.info("-" * 50)
     log.info("Application initialization complete")
 
+    res = run_prithvi(
+        molecule=smiles,
+        llm=llm,
+        az_model=az_model,
+        stability_flag=stability_flag,
+        hallucination_check=hallucination_check,
+        use_protecting_group_feature=use_protecting_group_feature,
+        local=local)
+    logging.info(f"Retrosynthesis result: {res}")
+    return res
+
+
+
+def single_run_test(smiles: str,
+                    llm: str = "claude-opus-4-20250514",
+                    az_model: str = "USPTO",
+                    stability_flag: str = "False",
+                    hallucination_check: str = "False",
+                    use_protecting_group_feature: bool = False,
+                    local: bool = False) -> Any:
+ 
+
+    setup_logging()
+
+    log = structlog.get_logger()
+    log.info("-" * 50)
+    log.info("Application initialization complete")
     res = run_prithvi(
         molecule=smiles,
         llm=llm,

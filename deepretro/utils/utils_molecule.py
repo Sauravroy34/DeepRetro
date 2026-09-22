@@ -54,6 +54,64 @@ def is_valid_smiles(smiles: str) -> bool:
     return _parse_molecule(smiles) is not None
 
 
+def canonicalize(smiles: str) -> str:
+    """Return canonical SMILES, or the original string if parsing fails.
+
+    Parameters
+    ----------
+    smiles : str
+        Input SMILES string.
+
+    Returns
+    -------
+    str
+        Canonical SMILES, or the original string when RDKit cannot parse it.
+        Returning the input unchanged (rather than raising) lets callers use
+        the result as a stable cycle-detection key even for malformed input.
+
+    Examples
+    --------
+    >>> canonicalize("C(O)C")
+    'CCO'
+    >>> canonicalize("not_a_smiles")
+    'not_a_smiles'
+    """
+
+    molecule = _parse_molecule(smiles)
+    if molecule is None:
+        return smiles
+    return Chem.MolToSmiles(molecule, canonical=True)
+
+
+def try_canonicalize(smiles: str) -> str | None:
+    """Return canonical SMILES, or ``None`` when RDKit cannot parse the input.
+
+    The strict counterpart of :func:`canonicalize`, for callers that must
+    distinguish "already canonical" from "unparseable, returned unchanged".
+
+    Parameters
+    ----------
+    smiles : str
+        Input SMILES string.
+
+    Returns
+    -------
+    str or None
+        Canonical SMILES, or ``None`` when the string does not parse.
+
+    Examples
+    --------
+    >>> try_canonicalize("C(O)C")
+    'CCO'
+    >>> try_canonicalize("not_a_smiles") is None
+    True
+    """
+    molecule = _parse_molecule(smiles)
+    if molecule is None:
+        return None
+    return Chem.MolToSmiles(molecule, canonical=True)
+
+
 def substructure_matching(target_smiles: str, query_smiles: str) -> int:
     """Check whether a query molecule is a substructure of a target molecule.
 
@@ -115,7 +173,9 @@ def validity_check(
     tuple[list[list[str]], list[str], list[float]]
         Valid precursor pathways, explanations, and confidence scores. A
         pathway is kept only when every precursor is valid, is not identical
-        to the target molecule, and is not a substructure of the target.
+        to the target molecule, and does not contain the target as a
+        substructure (a precursor embedding the intact target means no
+        target bond was disconnected, so recursion would loop).
 
     Examples
     --------
@@ -164,9 +224,9 @@ def validity_check(
                 )
                 continue
 
-            if substructure_matching(molecule, smiles):
+            if substructure_matching(smiles, molecule):
                 logger.warning(
-                    "Molecule is substructure of target",
+                    "Target molecule is substructure of precursor",
                     molecule=molecule,
                     smiles=smiles,
                 )

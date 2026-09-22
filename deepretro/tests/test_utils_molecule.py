@@ -188,10 +188,12 @@ class TestValidityCheck:
         assert explanations == []
         assert confidence == []
 
-    def test_substructure_of_target_filtered_out(self) -> None:
+    def test_precursor_containing_target_filtered_out(self) -> None:
+        # Diethyl ether contains ethanol intact: no target bond was
+        # disconnected, so recursing on it would re-encounter the target.
         molecule = ETHANOL
-        res_molecules = [["CC"]]
-        res_explanations = ["ethyl fragment"]
+        res_molecules = [["CCOCC"]]
+        res_explanations = ["target embedded in precursor"]
         res_confidence = [0.6]
         pathways, explanations, confidence = utils_molecule.validity_check(
             molecule, res_molecules, res_explanations, res_confidence
@@ -199,6 +201,21 @@ class TestValidityCheck:
         assert pathways == []
         assert explanations == []
         assert confidence == []
+
+    def test_precursor_that_is_substructure_of_target_kept(self) -> None:
+        # Most real disconnections yield precursors that appear inside the
+        # target (e.g. salicylic acid + acetic anhydride -> aspirin); they
+        # must NOT be rejected.
+        molecule = "CC(=O)Oc1ccccc1C(=O)O"  # aspirin
+        res_molecules = [["O=C(O)c1ccccc1O", "CC(=O)OC(C)=O"]]
+        res_explanations = ["acetylation of salicylic acid"]
+        res_confidence = [0.95]
+        pathways, explanations, confidence = utils_molecule.validity_check(
+            molecule, res_molecules, res_explanations, res_confidence
+        )
+        assert pathways == [["O=C(O)c1ccccc1O", "CC(=O)OC(C)=O"]]
+        assert explanations == ["acetylation of salicylic acid"]
+        assert confidence == [0.95]
 
     def test_single_smiles_string_instead_of_list(self) -> None:
         molecule = BENZENE
@@ -253,3 +270,23 @@ class TestDetectEightMemberRings:
     def test_invalid_smiles_raises_value_error(self) -> None:
         with pytest.raises(ValueError, match="Invalid SMILES string provided"):
             utils_molecule.detect_eight_member_rings(INVALID_SMILES)
+
+
+class TestCanonicalize:
+    """Tests for ``utils_molecule.canonicalize``."""
+
+    def test_non_canonical_input_is_canonicalized(self) -> None:
+        assert utils_molecule.canonicalize("C(O)C") == "CCO"
+
+    def test_already_canonical_is_stable(self) -> None:
+        assert utils_molecule.canonicalize(ETHANOL) == "CCO"
+
+    def test_equivalent_smiles_map_to_same_string(self) -> None:
+        aspirin_a = "CC(=O)Oc1ccccc1C(=O)O"
+        aspirin_b = "O=C(O)c1ccccc1OC(C)=O"
+        assert utils_molecule.canonicalize(aspirin_a) == utils_molecule.canonicalize(
+            aspirin_b
+        )
+
+    def test_invalid_smiles_returns_input_unchanged(self) -> None:
+        assert utils_molecule.canonicalize(INVALID_SMILES) == INVALID_SMILES
