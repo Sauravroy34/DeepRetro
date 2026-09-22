@@ -11,7 +11,7 @@ from deepretro.utils.variables import DEEPSEEK_MODELS, OPENAI_MODELS
 
 PromptMode = Literal["standard", "advanced"]
 ModelFamily = Literal["deepseek", "openai", "default"]
-ProviderName = Literal["anthropic", "openai", "deepseek"]
+ProviderName = Literal["anthropic", "openai", "deepseek", "local"]
 ThinkingEffort = Literal["low", "medium", "high", "max"]
 OutputTokenParam = Literal["max_tokens", "max_completion_tokens"]
 
@@ -295,6 +295,8 @@ def infer_provider(model: str) -> ProviderName:
     'anthropic'
     """
     lower_model = model.lower()
+    if lower_model.startswith(( "hf/")):
+        return "local"
     if model in DEEPSEEK_MODELS or "deepseek" in lower_model:
         return "deepseek"
     if model in OPENAI_MODELS or lower_model.startswith("openai/"):
@@ -328,6 +330,12 @@ def normalize_completion_model(model: str, provider: ProviderName) -> str:
     >>> normalize_completion_model("fireworks/deepseek-v3p2", "deepseek")
     'fireworks_ai/accounts/fireworks/models/deepseek-r1'
     """
+    if provider == "local":
+        for prefix in ("hf/"):
+            if model.lower().startswith(prefix):
+                return model[len(prefix):]
+        return model
+
     if provider != "deepseek":
         return model
 

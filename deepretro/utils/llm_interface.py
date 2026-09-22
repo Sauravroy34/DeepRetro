@@ -21,6 +21,7 @@ from deepretro.utils.llm_helpers import (
     extract_tag_content,
     resolve_model_selection,
 )
+from deepretro.utils.hf import generate
 from deepretro.utils.llm_trace import elapsed_ms, langfuse_metadata, record_llm_call
 from deepretro.utils.utils_molecule import detect_seven_member_rings
 from deepretro.utils.variables import (
@@ -349,6 +350,53 @@ class LLMInterface(ABC):
         return LLMResponse(status_code=400, text=last_error)
 
 
+
+class HuggingfaceLLM(LLMInterface):
+
+
+    def parse_response(self, response_text: str) -> tuple[int, list[str], str]:
+
+        json_content = extract_json_payload(response_text)
+        if not json_content:
+            return 502, [], ""
+        return 200, [], json_content
+
+    def call(self, request: LLMRequest) -> LLMResponse:
+
+        sys_prompt, user_prompt, default_max_tokens = self.obtain_prompt()
+        max_tokens = request.max_output_tokens or default_max_tokens
+
+        logger.info(
+            "Calling local HuggingFace model",
+            model=self.selection.completion_model,
+            molecule=request.molecule,
+        )
+
+        try:
+            content = generate(
+                model_name=self.selection.completion_model,
+                smiles=request.molecule,
+                user_prompt=user_prompt,
+                top_p=1.0,
+                max_tokens=max_tokens,
+                SYS_PROMPT=sys_prompt,
+                temperature=request.temperature,
+            )
+
+            response_text = coerce_response_text(content)
+            logger.debug(
+                "Received local LLM response", response_length=len(response_text)
+            )
+            return LLMResponse(status_code=200, text=response_text)
+        except Exception as exc:
+            logger.error(
+                "Local HuggingFace model call failed",
+                model=self.selection.completion_model,
+                error=str(exc),
+            )
+            return LLMResponse(status_code=400, text=str(exc))
+
+
 class AnthropicLLM(LLMInterface):
     """LLM interface for Anthropic/Claude-compatible responses.
 
@@ -536,4 +584,7 @@ def create_llm_interface(
         return DeepSeekLLM(model, prompt_mode=prompt_mode)
     if selection.provider == "anthropic":
         return AnthropicLLM(model, prompt_mode=prompt_mode)
+    if selection.provider == "local":
+        return HuggingfaceLLM(model, prompt_mode=prompt_mode)
+    
     return AnthropicLLM(model, prompt_mode=prompt_mode)
