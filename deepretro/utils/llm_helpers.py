@@ -331,9 +331,8 @@ def normalize_completion_model(model: str, provider: ProviderName) -> str:
     'fireworks_ai/accounts/fireworks/models/deepseek-r1'
     """
     if provider == "local":
-        for prefix in ("hf/"):
-            if model.lower().startswith(prefix):
-                return model[len(prefix):]
+        if model.lower().startswith("hf/"):
+            return model[len("hf/"):]
         return model
 
     if provider != "deepseek":

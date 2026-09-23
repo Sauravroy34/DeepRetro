@@ -20,6 +20,7 @@ from deepretro.utils.llm_helpers import (
     extract_json_payload,
     extract_tag_content,
     resolve_model_selection,
+    strip_code_fences
 )
 from deepretro.utils.hf import generate
 from deepretro.utils.llm_trace import elapsed_ms, langfuse_metadata, record_llm_call
@@ -356,7 +357,7 @@ class HuggingfaceLLM(LLMInterface):
 
     def parse_response(self, response_text: str) -> tuple[int, list[str], str]:
 
-        json_content = extract_json_payload(response_text)
+        json_content = strip_code_fences(response_text)
         if not json_content:
             return 502, [], ""
         return 200, [], json_content
