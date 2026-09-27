@@ -108,9 +108,14 @@ export function buildPathwayGraph(result: PathwayResult): NormalizedPathwayGraph
   const dependencyMap = normalizeDependencyMap(parsed);
   const parentMap = buildParentMap(dependencyMap);
   const stepMap = Object.fromEntries(parsed.steps.map((step) => [String(step.step), step]));
+
+  // The synthetic root duplicates step 1's product (the target molecule), so
+  // when step 1 exists its node acts as the graph root instead of adding a
+  // separate node that repeats the same structure.
+  const hasRootStep = parsed.steps.some((step) => String(step.step) === "1");
   const virtualRoot = createVirtualRootNode(parsed);
 
-  const nodes: NormalizedStepNode[] = [virtualRoot];
+  const nodes: NormalizedStepNode[] = hasRootStep ? [] : [virtualRoot];
   const edges: NormalizedPathwayGraph["edges"] = [];
 
   const sortedSteps = [...parsed.steps].sort(
@@ -119,11 +124,13 @@ export function buildPathwayGraph(result: PathwayResult): NormalizedPathwayGraph
 
   for (const step of sortedSteps) {
     const stepId = String(step.step);
+    const isTargetRoot = hasRootStep && stepId === "1";
     nodes.push({
       id: `step-${stepId}`,
       stepId,
-      title: `Step ${stepId}`,
+      title: isTargetRoot ? `Step ${stepId} · Target` : `Step ${stepId}`,
       isVirtualRoot: false,
+      isTargetRoot,
       rawStep: step,
       products: normalizeMolecules(step.products, "product", stepId),
       reactants: normalizeMolecules(step.reactants, "reactant", stepId),
@@ -131,11 +138,15 @@ export function buildPathwayGraph(result: PathwayResult): NormalizedPathwayGraph
       metrics: step.reactionmetrics?.[0],
       conditions: step.conditions,
       childIds: dependencyMap[stepId] ?? [],
-      parentIds: parentMap[stepId] ?? [],
+      parentIds: isTargetRoot
+        ? (parentMap[stepId] ?? []).filter((parent) => parent !== VIRTUAL_ROOT_STEP)
+        : parentMap[stepId] ?? [],
     });
   }
 
-  nodes[0].childIds = dependencyMap[VIRTUAL_ROOT_STEP] ?? [];
+  if (!hasRootStep) {
+    nodes[0].childIds = dependencyMap[VIRTUAL_ROOT_STEP] ?? [];
+  }
   const validNodeIds = new Set(nodes.map((node) => node.id));
 
   for (const [parent, children] of Object.entries(dependencyMap)) {
@@ -161,7 +172,9 @@ export function buildPathwayGraph(result: PathwayResult): NormalizedPathwayGraph
     dependencyMap,
     nodes,
     edges,
-    virtualRoot,
+    virtualRoot: hasRootStep
+      ? nodes.find((node) => node.isTargetRoot) ?? virtualRoot
+      : virtualRoot,
   };
 }
 

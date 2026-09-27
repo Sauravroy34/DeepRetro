@@ -113,6 +113,8 @@ export type NormalizedStepNode = {
   stepId: string;
   title: string;
   isVirtualRoot: boolean;
+  /** Real step whose product is the target molecule (root of the graph). */
+  isTargetRoot?: boolean;
   rawStep?: PathwayStep;
   products: NormalizedMolecule[];
   reactants: NormalizedMolecule[];

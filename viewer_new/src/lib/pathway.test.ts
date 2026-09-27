@@ -30,13 +30,27 @@ const sampleResult: PathwayResult = {
 };
 
 describe("pathway utilities", () => {
-  test("builds a graph with a virtual root", () => {
+  test("uses step 1 as the target root when it exists", () => {
     const graph = buildPathwayGraph(sampleResult);
 
-    expect(graph.virtualRoot.stepId).toBe("0");
-    expect(graph.nodes).toHaveLength(3);
-    expect(graph.edges.map((edge) => edge.id)).toContain("edge-0-1");
+    expect(graph.virtualRoot.stepId).toBe("1");
+    expect(graph.virtualRoot.isTargetRoot).toBe(true);
+    expect(graph.virtualRoot.title).toBe("Step 1 · Target");
+    expect(graph.nodes).toHaveLength(2);
+    expect(graph.nodes.some((node) => node.isVirtualRoot)).toBe(false);
+    expect(graph.edges.map((edge) => edge.id)).not.toContain("edge-0-1");
     expect(graph.edges.map((edge) => edge.id)).toContain("edge-1-2");
+  });
+
+  test("falls back to a virtual root when step 1 is missing", () => {
+    const graph = buildPathwayGraph({
+      dependencies: { 2: [] },
+      steps: [sampleResult.steps[1]],
+    });
+
+    expect(graph.virtualRoot.stepId).toBe("0");
+    expect(graph.virtualRoot.isVirtualRoot).toBe(true);
+    expect(graph.nodes).toHaveLength(2);
   });
 
   test("updates a step in place without mutating other steps", () => {
