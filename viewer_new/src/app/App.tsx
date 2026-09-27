@@ -71,6 +71,7 @@ export function App() {
 
   const [feedback, setFeedback] = useState("");
   const [error, setError] = useState("");
+  const [backendRailCollapsed, setBackendRailCollapsed] = useState(false);
 
   const {
     activeRun,
@@ -288,14 +289,16 @@ export function App() {
         <div />
       )}
 
-      <div className="workspace">
+      <div className={`workspace${backendRailCollapsed ? " sidebar-collapsed" : ""}`}>
         <RunSidebar
+          collapsed={backendRailCollapsed}
           runtimeConfig={runtimeConfig}
           advancedSettings={advancedSettings}
           health={health}
           instanceSettings={instanceSettings}
           runs={runs}
           activeRunKey={activeRunKey}
+          onCollapsedChange={setBackendRailCollapsed}
           onRunSelect={setActiveRun}
           onUploadFiles={(files) => {
             try {

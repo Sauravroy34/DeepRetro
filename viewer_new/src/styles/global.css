@@ -505,6 +505,12 @@ html[data-theme="dark"] .molecule-chip {
   display: grid;
   grid-template-columns: 292px minmax(0, 1fr) 336px;
   min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.workspace.sidebar-collapsed {
+  grid-template-columns: 72px minmax(0, 1fr) 336px;
 }
 
 .sidebar,
@@ -520,6 +526,66 @@ html[data-theme="dark"] .molecule-chip {
   display: flex;
   flex-direction: column;
   gap: 14px;
+}
+
+.sidebar.collapsed {
+  padding: 10px 8px;
+}
+
+.sidebar.collapsed .sidebar-panel {
+  gap: 12px;
+}
+
+.sidebar.collapsed .panel__header {
+  justify-content: center;
+}
+
+.sidebar.collapsed .sidebar-heading {
+  display: none;
+}
+
+.sidebar-collapse-button {
+  width: 30px;
+  height: 30px;
+}
+
+.backend-rail-item {
+  display: grid;
+  place-items: center;
+  gap: 5px;
+  width: 54px;
+  min-height: 52px;
+  padding: 7px 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.backend-rail-item span {
+  max-width: 46px;
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 9px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.backend-rail-item:hover,
+.backend-rail-item.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.backend-rail-upload {
+  cursor: pointer;
+}
+
+.compact-local-runs {
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 
 .inspector {
@@ -767,8 +833,17 @@ html[data-theme="dark"] .toggle-row {
 
 .toggle-switch__input {
   position: absolute;
+  width: 1px;
+  min-width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
   opacity: 0;
-  pointer-events: none;
 }
 
 .toggle-switch {
@@ -1668,6 +1743,10 @@ html[data-theme="dark"] .editor-condition-row {
     border-left: 0;
     border-top: 1px solid var(--border);
   }
+
+  .workspace.sidebar-collapsed {
+    grid-template-columns: 72px minmax(0, 1fr);
+  }
 }
 
 @media (max-width: 960px) {
@@ -1679,6 +1758,15 @@ html[data-theme="dark"] .editor-condition-row {
   .workspace {
     display: flex;
     flex-direction: column;
+  }
+
+  .workspace.sidebar-collapsed {
+    display: flex;
+  }
+
+  .sidebar.collapsed .stack {
+    display: flex;
+    overflow-x: auto;
   }
 
   .sidebar {

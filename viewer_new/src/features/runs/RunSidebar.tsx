@@ -1,5 +1,14 @@
-import { useId } from "react";
-import { Activity, CheckCircle2, CircleAlert, LoaderCircle, Upload } from "lucide-react";
+import { useId, type ChangeEvent } from "react";
+import {
+  Activity,
+  CheckCircle2,
+  CircleAlert,
+  FileJson,
+  LoaderCircle,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Upload,
+} from "lucide-react";
 
 import type {
   AdvancedSettingsConfig,
@@ -10,12 +19,14 @@ import type {
 } from "../../types/viewer";
 
 type RunSidebarProps = {
+  collapsed: boolean;
   runtimeConfig?: ViewerRuntimeConfig;
   advancedSettings?: AdvancedSettingsConfig;
   health: HealthStatusMap;
   instanceSettings: Record<string, InstanceRequestSettings>;
   runs: Record<string, ViewerRun>;
   activeRunKey?: string;
+  onCollapsedChange: (collapsed: boolean) => void;
   onRunSelect: (runKey: string) => void;
   onUploadFiles: (files: Array<{ fileName: string; input: unknown }>) => void;
   onUpdateSetting: (
@@ -69,12 +80,14 @@ function ToggleRow({
 }
 
 export function RunSidebar({
+  collapsed,
   runtimeConfig,
   advancedSettings,
   health,
   instanceSettings,
   runs,
   activeRunKey,
+  onCollapsedChange,
   onRunSelect,
   onUploadFiles,
   onUpdateSetting,
@@ -82,14 +95,44 @@ export function RunSidebar({
   const uploadInputId = useId();
   const uploadedRuns = Object.values(runs).filter((run) => run.source === "file");
 
+  const loadFiles = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? []);
+    if (!files.length) {
+      return;
+    }
+
+    try {
+      const parsedFiles = await Promise.all(
+        files.map(async (file) => ({
+          fileName: file.name,
+          input: JSON.parse(await file.text()),
+        })),
+      );
+      onUploadFiles(parsedFiles);
+    } catch (error) {
+      console.error("Failed to load uploaded files from sidebar.", error);
+    } finally {
+      event.target.value = "";
+    }
+  };
+
   return (
-    <aside className="sidebar">
+    <aside className={`sidebar${collapsed ? " collapsed" : ""}`}>
       <section className="panel sidebar-panel">
         <div className="panel__header">
-          <div>
+          <div className="sidebar-heading">
             <p className="eyebrow">Compare mode</p>
             <h2>Backend pathways</h2>
           </div>
+          <button
+            aria-label={collapsed ? "Expand backend panel" : "Collapse backend panel"}
+            className="ghost-button icon-button sidebar-collapse-button"
+            onClick={() => onCollapsedChange(!collapsed)}
+            title={collapsed ? "Expand backends" : "Collapse backends"}
+            type="button"
+          >
+            {collapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
+          </button>
         </div>
         <div className="stack">
           {runtimeConfig?.instances.map((instance) => {
@@ -98,6 +141,26 @@ export function RunSidebar({
             const settings = instanceSettings[instance.id] ?? instance.defaults;
             const modelCapabilities =
               advancedSettings?.llm_models[settings.model_type] ?? null;
+
+            if (collapsed) {
+              return (
+                <button
+                  aria-label={`Select ${instance.label}`}
+                  className={`backend-rail-item${activeRunKey === runKey ? " active" : ""}`}
+                  key={instance.id}
+                  onClick={() => {
+                    if (run) {
+                      onRunSelect(runKey);
+                    }
+                  }}
+                  title={instance.label}
+                  type="button"
+                >
+                  <span>{instance.label.split(" · ")[0]}</span>
+                  <StatusIcon run={run} />
+                </button>
+              );
+            }
 
             return (
               <article
@@ -217,10 +280,41 @@ export function RunSidebar({
               </article>
             );
           })}
+          {collapsed ? (
+            <label
+              aria-label="Add pathway files"
+              className="backend-rail-item backend-rail-upload"
+              htmlFor={uploadInputId}
+              title="Add pathway files"
+            >
+              <Upload size={16} />
+              <span>Add</span>
+            </label>
+          ) : null}
         </div>
       </section>
 
-      {uploadedRuns.length ? (
+      {uploadedRuns.length && collapsed ? (
+        <section className="panel sidebar-panel compact-local-runs">
+          <div className="stack">
+            {uploadedRuns.map((run) => (
+              <button
+                aria-label={`Select uploaded ${run.label}`}
+                className={`backend-rail-item${activeRunKey === run.key ? " active" : ""}`}
+                key={run.key}
+                onClick={() => onRunSelect(run.key)}
+                title={run.label}
+                type="button"
+              >
+                <FileJson size={16} />
+                <span>{run.label}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {uploadedRuns.length && !collapsed ? (
         <section className="panel sidebar-panel">
           <div className="panel__header">
             <div>
@@ -231,33 +325,6 @@ export function RunSidebar({
               <Upload size={16} />
               Add files
             </label>
-            <input
-              id={uploadInputId}
-              accept=".json,application/json"
-              className="sr-only"
-              type="file"
-              multiple
-              onChange={async (event) => {
-                const files = Array.from(event.target.files ?? []);
-                if (!files.length) {
-                  return;
-                }
-
-                try {
-                  const parsedFiles = await Promise.all(
-                    files.map(async (file) => ({
-                      fileName: file.name,
-                      input: JSON.parse(await file.text()),
-                    })),
-                  );
-                  onUploadFiles(parsedFiles);
-                } catch (error) {
-                  console.error("Failed to load uploaded files from sidebar.", error);
-                } finally {
-                  event.target.value = "";
-                }
-              }}
-            />
           </div>
           <div className="stack">
             {uploadedRuns.map((run) => (
@@ -280,6 +347,14 @@ export function RunSidebar({
           </div>
         </section>
       ) : null}
+      <input
+        id={uploadInputId}
+        accept=".json,application/json"
+        className="sr-only"
+        type="file"
+        multiple
+        onChange={loadFiles}
+      />
     </aside>
   );
 }
